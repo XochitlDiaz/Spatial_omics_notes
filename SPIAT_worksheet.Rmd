@@ -1,0 +1,932 @@
+---
+title: "SPIAT worksheet"
+author: "Yuzhou Feng"
+date: "`r Sys.Date()`"
+output: html_document
+editor_options: 
+  markdown: 
+    wrap: 72
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Welcome
+
+Welcome to the SPIAT spatial analysis workshop! In this worksheet we
+will explore how to analyse spatial proteomics data using SPIAT and simulate 
+spatial point pattern using spaSim. Let's get started!
+
+This worksheet was adapted from the [SPIAT tutorials](https://trigosteam.github.io/SPIAT/articles/SPIAT.html), but
+uses a real dataset instead. Please refer to the tutorials for
+detailed information.
+
+Please make sure you have installed all the required packages prior to
+the workshop. We won't have time for installation during the workshop.
+
+```{r install, message=FALSE}
+## Install the packages: 
+## (Only run the code if the packages were not installed yet)
+## (latest verion of R required >=4.3.0)
+
+# install.packages(c("elsa", "Rtsne", "umap", "alphahull", "plotly", "survminer", "survival", "vroom"))
+# install.packages(c("rmarkdown", "knitr"))
+# 
+# if (!require("BiocManager", quietly = TRUE))
+#     install.packages("BiocManager")
+# BiocManager::install(version = "3.18")
+# 
+# BiocManager::install("SPIAT")
+# BiocManager::install("spaSim")
+# BiocManager::install("ComplexHeatmap")
+```
+
+```{r load, message=FALSE}
+# load the libraries
+library(SPIAT)
+library(spaSim)
+```
+
+In this workshop we will demonstrate the analysis workflow with a public
+TNBC dataset (Keren et al., 2018).
+
+# Reading and formatting
+
+## Reading and formatting
+
+`format_image_to_spe()` is the main function to read in data to SPIAT.
+`format_image_to_spe()` creates a `SpatialExperiment` object which is
+used in all subsequent functions. The key data points of interest for
+SPIAT are cell coordinates, marker intensities and cell phenotypes for
+each cell.
+
+`format_image_to_spe()` has several options designed specifically for
+importing data generated from the inForm, HALO, CODEX and cellprofiler
+platforms. However, we advise using the more flexible 'general' option.
+Note that before using 'general', we advise pre-formatting your data.
+
+```{r}
+# use `?` to get the usage of a function in the "help" panel
+?format_image_to_spe
+```
+
+Now we'll use the `general` option to read in the TNBC MIBI data. This
+MIBI file is not the raw MIBI data, but was generated after cell
+segmentation (by Greg Bass, CSL). This shows SPIAT's capability of
+reading data from a wide range of formats.
+
+```{r}
+# read the csv
+path_to_file <- "cellData_with-centroids.csv" # put the path to the csv in the quote
+mibi <- vroom::vroom(path_to_file)
+mibi[1:5,] # look at the first 5 rows
+unique(mibi$SampleID) # how many unique samples here?
+```
+
+```{r}
+# slice the data frame to keep only the sample with `sampleID==4`
+mibi_4 <- mibi[mibi$SampleID == 4, ]
+dim(mibi_4)
+# add a column of cell IDs
+mibi_4$CellID <- paste("Cell", mibi_4$cellLabelInImage, sep="_")
+```
+
+```{r}
+# construct the elements of the SPE object
+## the marker intensity matrix
+intensity <- t(mibi_4[,13:52])
+intensity <- rbind(intensity, Tumor = mibi_4$tumorYN)
+intensity <- intensity[rownames(intensity) %in% c("CD4", "CD3", "CD8",
+                                                "CD20", "MPO", "CD68",
+                                                "Tumor"),]
+colnames(intensity) <- mibi_4$CellID # add cell IDs
+intensity[, 1:5] # print the intensity of first 5 cells
+## the coordinates
+coord_x <- mibi_4$Xc
+coord_y <- mibi_4$Yc
+## we don't have phenotype info in the file. Will predict the phenotypes later
+
+# now format the image with function `format_image_to_spe()`
+mibi_4_spe <- format_image_to_spe(format = "general", phenotypes = NA,
+                                  intensity_matrix = intensity,
+                                  coord_x = coord_x, coord_y = coord_y)
+```
+
+Now we get the SPE object of the image with `sampleID==4`.
+
+## Predicting phenotypes
+
+You'll notice there is no phenotype info in the MIBI .csv file. Let's
+use SPIAT to predict phenotypes based on the marker intensity
+distribution of all cells.
+
+```{r}
+# Print the markers to predict
+rownames(assay(mibi_4_spe))
+# Predict (`reference_phenotypes = FALSE` because there are no default phenotypes)
+mibi_4_spe <- predict_phenotypes(mibi_4_spe, tumour_marker = "Tumor",
+                   baseline_markers = c("CD4", "CD68", "CD8", "CD3", "CD20", "MPO"),
+                   reference_phenotypes = FALSE)
+```
+
+Have a look at the structure of this object. There are three main
+measurements of interest (coordinates, phenotype, intensities).
+
+```{r}
+# View(mibi_4_spe)
+# Access phenotype as a column (accessed with $)
+# Print the unique phenotypes
+unique(mibi_4_spe$Phenotype)
+# What is the dimension of the intensity matrix of this object?
+dim(assay(mibi_4_spe))
+# Access marker intensities with the helper function 'assay'
+# Print the marker intensities of the first 5 cells
+assay(mibi_4_spe)[, 1:5]
+# Access coordinates with the helper function 'spatialCoords'
+spatialCoords(mibi_4_spe)[1:5, ]
+```
+
+## Define cell types
+
+Then we define the cell types.
+
+```{r}
+phenotypes <- c("Tumor", "CD68", "CD20", "CD4,CD3", "CD3", "CD8,CD3", 
+                "CD4", "MPO", "CD8")
+cell_types <- c("Tumor", "Macrophage", "B_cells",  "Helper_T_cell", "T_cell",
+                "Cyto_T_cell",  "Helper_T_cell", "Neutrophil", "Cyto_T_cell")
+
+defined_mibi_4 <- define_celltypes(
+    mibi_4_spe, 
+    categories = phenotypes, 
+    category_colname = "Phenotype", 
+    names = cell_types,
+    new_colname = "Cell.Type")
+unique(defined_mibi_4$Cell.Type)
+```
+
+You can write a `for` loop to read all of the patients' images. We will
+look into that later.
+
+# Quality control and data visualisation
+
+We'll now use SPIAT's quality control functions to check phenotyping
+quality, detect uneven staining, and test for other potential technical
+artefacts.
+
+## Visualise marker levels
+
+Phenotyping of cells can be verified comparing marker intensities of
+cells labelled positive and negative for a marker. Cells positive for a
+marker should have high levels of the marker. An unclear separation of
+marker intensities between positive and negative cells would suggest
+phenotypes have not been accurately assigned. We can use
+`marker_intensity_boxplot()` to produce a boxplot for cells phenotyped
+as being positive or negative for a marker.
+
+```{r}
+markers <- rownames(assay(mibi_4_spe))
+for (marker in markers){
+  print(marker_intensity_boxplot(mibi_4_spe, marker))
+}
+```
+
+Uneven marker staining or high background intensity can be identified
+with `plot_cell_marker_levels()`. This produces a scatter plot of the
+intensity of a marker in each cell. This should be relatively even
+across the image and all phenotyped cells. Cells that were not
+phenotyped as being positive for the particular marker are excluded.
+
+```{r}
+plot_cell_marker_levels(mibi_4_spe, "CD3")
+# Try plot all markers with a for loop~
+for (marker in markers){
+  print(plot_cell_marker_levels(mibi_4_spe, marker))
+}
+```
+
+For large images, there is also the option of 'blurring' the image with
+function `plot_marker_level_heatmap()`, where the image is split into
+multiple small areas, and marker intensities are averaged within each.
+The image is blurred based on the `num_splits` parameter.
+
+```{r}
+# Try it yourself~
+```
+
+## Identifying incorrect phenotypes
+
+We may see cells with biologically implausible combination of markers
+present in the input data when using:
+
+```{r}
+unique(mibi_4_spe$Phenotype)
+```
+
+Removing cells with incorrect phenotypes: If you identify incorrect
+phenotypes or have any properties (columns) that you want to exclude you
+can use `select_celltypes()`. Set `celltypes` as the values that you
+want to keep or exclude for a column (`feature_colname`). Set `keep` as
+`TRUE` to include these cells and `FALSE` to exclude them.
+
+```{r}
+data_subset <- select_celltypes(
+  mibi_4_spe, keep=TRUE,
+  celltypes = c("Tumor", "CD68", "CD20", "CD4,CD3", 
+                 "CD3", "CD8,CD3", "CD4", "MPO", "CD8"),
+  feature_colname = "Phenotype")
+# have a look at what phenotypes are present
+unique(data_subset$Phenotype)
+# All the cells with the rest of the combinations of phenotypes were removed.
+# define cell types (try it yourself~)
+defined_mibi_subset <- define_celltypes(mibi_4_spe, category_colname = "Phenotype"
+)
+```
+
+## Dimensionality reduction to identify misclassified cells
+
+We can also check for specific misclassified cells using dimensionality
+reduction. SPIAT offers tSNE and UMAPs based on marker intensities to
+visualise cells. Cells of distinct types should form clearly different
+clusters.
+
+The generated dimensionality reduction plots are interactive, and users
+can hover over each cell to obtain the cell ID. Users can then remove
+specific misclassified cells.
+
+```{r}
+g <- dimensionality_reduction_plot(defined_mibi_subset, plot_type = "TSNE", 
+                                   feature_colname = "Cell.Type")
+```
+
+Note that `dimensionality_reduction_plot()` only prints a static version
+of the UMAP or tSNE plot. To interact with this plot, pass the result to
+the `ggplotly()` function from the `plotly` package.
+
+```{r}
+plotly::ggplotly(g)
+```
+
+## Visualising tissues
+
+Let's go back to the image without filtering out the undefined cells -
+`mibi_4_spe`.
+
+We can see the location of all cell types (or any column in the data) in
+the tissue with `plot_cell_categories()`. Each dot in the plot
+corresponds to a cell and cells are coloured by cell type. Any cell
+types present in the data but not in the cell types of interest will be
+put in the category "OTHER" and coloured lightgrey.
+
+```{r}
+my_colors <- c("red", "blue","orange", "purple", "pink", "darkcyan", "darkgreen")
+categories_of_interest <- c("Tumor", "Macrophage", "B_cells",  "Helper_T_cell", 
+                            "T_cell", "Cyto_T_cell", "Neutrophil")
+  
+plot_cell_categories(spe_object = defined_mibi_4, 
+                     categories_of_interest = categories_of_interest, 
+                     colour_vector = my_colors, feature_colname = "Cell.Type")
+```
+
+We can visualise a selected marker in 3D with `marker_surface_plot()`.
+The image is blurred based on the `num_splits` parameter.
+
+```{r}
+marker_surface_plot(defined_mibi_4, num_splits=15, marker="CD68")
+```
+
+To visualise multiple markers in 3D in a single plot we can use
+`marker_surface_plot_stack()`. This shows normalised intensity level of
+specified markers and enables the identification of co-occurring and
+mutually exclusive markers.
+
+```{r}
+marker_surface_plot_stack(defined_mibi_4, num_splits=15, markers_to_plot=c("CD68", "CD20"))
+```
+
+# Basic analyses
+
+## Cell percentages
+
+Obtain the number and proportion of each cell type. We can exclude any
+cell types that are not of interest e.g. "Undefined" with
+`celltypes_to_exclude`.
+
+```{r}
+p_cells <- calculate_cell_proportions(defined_mibi_4, 
+                                      feature_colname ="Cell.Type",
+                                      celltypes_to_exclude = c("Others","Undefined"),
+                                      plot.image = TRUE)
+```
+
+```{r}
+plot_cell_percentages(cell_proportions = p_cells, 
+                      cells_to_exclude = "Tumor", cellprop_colname="Proportion_name")
+```
+
+## Cell distances
+
+We can calculate the pairwise distances between two cell types (cell
+type A and cell type B) with
+`calculate_pairwise_distances_between_cell_types()`. This function
+calculates the distances of all cells of type A against all cells of
+type B.
+
+```{r}
+distances <- calculate_pairwise_distances_between_celltypes(
+  spe_object = defined_mibi_4, 
+  cell_types_of_interest = c("Tumor", "B_cells", "T_cell"),
+  feature_colname = "Cell.Type")
+```
+
+```{r}
+# Visualise the distances
+plot_cell_distances_violin(distances)
+```
+
+We can also calculate summary statistics for the distances between each
+combination of cell types, the mean, median, min, max and standard
+deviation, with `calculate_summary_distances_between_celltypes()`.
+
+```{r}
+summary_distances <- calculate_summary_distances_between_celltypes(distances)
+summary_distances
+```
+
+An example of the interpretation of this result is: "average pairwise
+distance between cells of Tumor and B cells is 1107.9081.
+
+These pairwise cell distances can then be visualised as a heatmap with
+plot_distance_heatmap(). This example shows the average pairwise
+distances between cell types. Note that the pairwise distances are
+symmetrical (the average distance between cell type A and cell type B is
+the same as the average distance between cell Type B and cell Type A).
+
+```{r}
+plot_distance_heatmap(phenotype_distances_result = summary_distances, metric = "mean")
+```
+
+The same workflow also applies to minimum distance between cell types.
+Give it a go with the following functions:
+`calculate_minimum_distances_between_celltypes()`,
+`plot_cell_distances_violin()`,
+`calculate_summary_distances_between_celltypes()`,
+`plot_distance_heatmap()`.
+
+```{r}
+# Try these yourself~
+min_distances = calculate_minimum_distances_between_celltypes(spe_object = defined_mibi_4, 
+  cell_types_of_interest = c("Tumor", "B_cells", "T_cell"),
+  feature_colname = "Cell.Type")
+plot_cell_distances_violin(min_distances)
+min_distances_sum =calculate_summary_distances_between_celltypes(min_distances)
+plot_distance_heatmap(min_distances_sum, metric = "mean")
+```
+
+# Cell colocalisation
+
+With SPIAT we can quantify cell colocalisation, which refers to how much
+two cell types are colocalising and thus potentially interacting.
+
+## Cells in Neighbourhood (CIN)
+
+We can calculate the average percentage of cells of one cell type
+(target) within a radius of another cell type (reference) using
+`average_percentage_of_cells_within_radius()`.
+
+```{r}
+average_percentage_of_cells_within_radius(spe_object = defined_mibi_4, 
+                                          reference_celltype = "B_cells", 
+                                          target_celltype = "Macrophage", 
+                                          radius=100, feature_colname="Cell.Type")
+```
+
+Alternatively, this analysis can also be performed based on marker
+intensities rather than cell types. Here, we use
+`average_marker_intensity_within_radius()` to calculate the average
+intensity of the target_marker within a radius from the cells positive
+for the reference marker. Note that it pools all cells with the target
+marker that are within the specific radius of any reference cell.
+Results represent the average intensities within a radius.
+
+```{r}
+average_marker_intensity_within_radius(spe_object = defined_mibi_4,
+                                       reference_marker ="CD20",
+                                       target_marker = "CD68",
+                                       radius=100)
+```
+
+`plot_average_intensity()` calculates the average intensity of a target
+marker for a number of user-supplied radii values, and plots the
+intensity level at each specified radius as a line graph.
+
+```{r}
+plot_average_intensity(spe_object=defined_mibi_4, 
+                       reference_marker="CD20", 
+                       target_marker="CD68", radii=seq(20, 100, 5))
+```
+
+What can you interpret from this plot?
+
+## Mixing Score (MS) and Normalised Mixing Score (NMS)
+
+Mixing score (MS) in SPIAT is defined as the number of target-reference
+interactions divided by the number of reference-reference interactions
+within a specified radius. The higher the score the greater the mixing
+of the two cell types. The normalised score is normalised for the number
+of target and reference cells in the image.
+
+```{r}
+# What is the mixing score between Tumor cells and Macrophage in our sample?
+mixing_score_summary(spe_object = defined_mibi_4, 
+                     reference_celltype = "Tumor", 
+                     target_celltype = "Macrophage", 
+                     radius=20, feature_colname ="Cell.Type")
+```
+
+## Cross K function
+
+Cross K function calculates the number of target cell types across a
+range of radii from a reference cell type, and compares the behaviour of
+the input image with an image of randomly distributed points using a
+Poisson point process. There are four patterns that can be distinguished
+from K-cross function - independent, mixed clusters, mixed one cluster,
+separate clusters.
+
+Try different cell types with different radii using
+`calculate_cross_functions()` . What patterns do you identify?
+
+```{r}
+df_cross <- calculate_cross_functions(defined_mibi_4, method = "Kcross", 
+                                      cell_types_of_interest = c("Tumor", "B_cells"), 
+                                      feature_colname ="Cell.Type",
+                                      dist = 500)
+```
+
+We can calculate the area under the curve (AUC) of the cross K-function.
+In general, this tells us the two types of cells are:
+
+-   negative values: separate clusters
+
+-   positive values: mixing of cell types
+
+```{r}
+AUC_of_cross_function(df_cross)
+```
+
+## Cross-K Intersection (CKI)
+
+There is another pattern in cross K curve which has not been previously
+appreciated, which is when there is a "ring" of one cell type, generally
+immune cells, surrounding the area of another cell type, generally
+tumour cells. For this pattern, the observed and expected curves in
+cross K function cross or intersect, such as the cross K plot above.
+
+While this pattern does not appear in the example data, you can
+experiment with this pattern using the simulated data from the SPIAT
+package, or refer to the [CKI section in the
+tutorial](https://trigosteam.github.io/SPIAT/articles/cell-colocalisation.html#cross-k-intersection-cki).
+
+## Aggregated entropy gradient
+
+The function `entropy_gradient_aggregated()` proposes the aggregated
+entropy gradient as a self-contained metric to define the attraction and
+repulsion of cell types. You don't have to set arbitrary threshold, but
+only use the shape of the curve to determine the colocalisation. The
+details of this algorithm were discussed thoroughly in Fig. 4 and
+Supplementary Fig. 4 of the
+[paper](https://www.nature.com/articles/s41467-023-37822-0).
+
+Let's have a look what results this function gives us.
+
+```{r}
+table(defined_mibi_4$Cell.Type)
+gradient_pos <- c(50, 75, 100, 125, 150, 175, 200, 250, 300, 350, 400, 450, 500, 550, 600)
+grad <- entropy_gradient_aggregated(defined_mibi_4, 
+                                    cell_types_of_interest = c("Macrophage", "Tumor"),
+                                    feature_colname = "Cell.Type",
+                                    radii =  gradient_pos)
+
+grad
+```
+
+Plot the gradients.
+
+```{r}
+v <- as.numeric(grad$gradient_df[1,3:(length(gradient_pos)+2)])
+plot(v, type = "b", lty = 2, pch = 16, cex = 1)
+```
+
+The trend indicates there is repulsion between tumor and macrophages.
+Let's re-visit the cell category plot of the image and see the locations
+of these cells.
+
+```{r}
+plot_cell_categories(spe_object = defined_mibi_4, 
+                     categories_of_interest = categories_of_interest, 
+                     colour_vector = my_colors, feature_colname = "Cell.Type")
+```
+
+Note that the shape of the curve is determined by several factors,
+including using which cell type as the reference cells. The discussion
+of this is included in the [Supplementary Fig. 4](https://www.nature.com/articles/s41467-023-37822-0/figures/4) of the paper.
+
+# Spatial Heterogeneity
+
+Cell colocalisation metrics allow capturing a dominant spatial pattern
+in an image. However, patterns are unlikely to be distributed evenly in
+a tissue, but rather there will be spatial heterogeneity of patterns. To
+measure this, SPIAT splits the image into smaller images (either using a
+grid or concentric circles around a reference cell population), followed
+by calculation of a spatial metric of a pattern of interest (e.g. cell
+colocalisation, entropy), and then measures the Prevalence and
+Distinctiveness of the pattern.
+
+## Entropy
+
+Entropy in spatial analysis refers to the balance in the number of cells
+of distinct populations. An entropy score can be obtained for an entire
+image. However, the entropy of one image does not provide us spatial
+information of the image.
+
+```{r}
+calculate_entropy(defined_mibi_4, cell_types_of_interest = c("Tumor","Macrophage"), 
+                  feature_colname = "Cell.Type")
+```
+
+We therefore propose the concept of Localised Entropy which calculates
+an entropy score for a predefined local region.
+
+## Fishnet grid
+
+One approach to calculate localised metric is to split the image into
+fishnet grid squares. For each grid square, `grid_metrics()` calculates
+the metric for that square and visualise the raster image. You can
+choose any metric as the localised metric. Here we use entropy as an
+example.
+
+For cases where the localised metric is not symmetrical (requires
+specifying a target and reference cell type), the first item in the
+vector used for `cell_types_of_interest` marks the reference cells and
+the second item the target cells. Here we are using Entropy, which is
+symmetrical, so we can use any order of cell types in the input.
+
+```{r}
+grid <- grid_metrics(defined_mibi_4, FUN = calculate_entropy, n_split = 20,
+                     cell_types_of_interest=c("Tumor","Macrophage"), 
+                     feature_colname = "Cell.Type")
+```
+
+After calculating the localised entropy for each of the grid squares, we
+can apply metrics like percentages of grid squares with patterns
+(Prevalence) and Moran's I (Distinctiveness).
+
+For the Prevalence, we need to select a threshold over which grid
+squares are considered 'positive' for the pattern. The selection of
+threshold depends on the pattern and metric the user chooses to find the
+localised pattern. Here we chose 0.73 for entropy because 0.73 is
+roughly the entropy of two cell types when their ratio is 1:4 or 4:1.
+
+You might be curious of how the entropy is calculated based on the
+ratio. Use the following helper function to calculate the entropy for
+any composition of cell counts.
+
+```{r entropy_helper}
+entropy_helper <- function(v){
+   s <- sum(v); l <- length(v); e <- 0
+   for (i in 1:l) e <- e + -(v[i]/s)*log2(v[i]/s) 
+   return(e)
+ }
+```
+
+What is the entropy when the ratio of two cell types is 1:4?
+
+```{r}
+entropy_helper(c(1,4))
+entropy_helper(c(1,8))
+entropy_helper(c(1,16))
+```
+
+```{r}
+calculate_percentage_of_grids(grid, threshold = 0.73, above = TRUE)
+calculate_spatial_autocorrelation(grid, metric = "globalmoran")
+```
+
+# Characterise tissue structure
+
+In certain analysis the focus is to understand the spatial distribution
+of a certain type of cell populations relative to the tissue regions.
+
+One example of this functionality is to characterise the immune
+population in tumour structures. The following analysis will focus on
+the tumour/immune example, including determining whether there is a
+clear tumour margin, automatically identifying the tumour margin, and
+finally quantifying the proportion of immune populations relative to the
+margin. However, these analyses can also be generalised to other tissue
+and cell types.
+
+### Determining whether there is a clear tumour margin
+
+In some instances tumour cells are distributed in such a way that there
+are no clear tumour margins. While this can be derived intuitively in
+most cases, SPIAT offers a way of quantifying the 'quality' of the
+margin for downstream analyses. This is meant to be used to help flag
+images with relatively poor margins, and therefore we do not offer a
+cutoff value.
+
+To determine if there is a clear tumour margin, SPIAT can calculate the
+ratio of tumour bordering cells to tumour total cells (R-BC). This ratio
+is high when there is a disproportional high number of tumour margin
+cells compared to internal tumour cells.
+
+```{r}
+R_BC(defined_mibi_4, cell_type_of_interest = "Tumor", "Cell.Type")
+```
+
+The result is 0.1508639. This low value means there are relatively low
+number of bordering cells compared to total tumour cells, meaning that
+this image has clear tumour margins.
+
+### Automatic identification of the tumour margin
+
+We can identify margins with `identify_bordering_cells()`. This function
+leverages off the alpha hull method (Pateiro-Lopez, Rodriguez-Casal,
+and. 2019) from the alpha hull package. Here we use tumour cells
+(Tumour_marker) as the reference to identify the bordering cells but any
+cell type can be used.
+
+```{r}
+formatted_border <- identify_bordering_cells(defined_mibi_4, 
+                                             reference_cell = "Tumor", 
+                                             feature_colname="Cell.Type",
+                                             ahull_alpha = 30,
+                                             n_to_exclude = 25)
+# Try with different ahull_alpha values and n_to_exclude values
+
+# Then get the number of tumour clusters
+attr(formatted_border, "n_of_clusters")
+```
+
+There are 3 tumour clusters in the image.
+
+### Classification of cells based on their locations relative to the margin
+
+First, we calculate the distance of cells to the tumour margin.
+
+```{r}
+formatted_distance <- calculate_distance_to_margin(formatted_border)
+```
+
+Next, we classify cells based on their location. As a distance cutoff,
+we use a distance of 5 cells from the tumour margin. The function first
+calculates the average minimum distance between all pairs of nearest
+cells and then multiples this number by 5. Users can change the number
+of cell layers to increase/decrease the margin width or use another
+argument `margin_dist`.
+
+```{r}
+names_of_immune_cells <- c("B_cells",  "Helper_T_cell", "T_cell",
+                "Cyto_T_cell",  "Helper_T_cell", "Neutrophil", "Cyto_T_cell")
+
+formatted_structure <- define_structure(
+  formatted_distance, cell_types_of_interest = names_of_immune_cells, 
+  feature_colname = "Cell.Type", margin_dist = 90)
+
+categories <- unique(formatted_structure$Structure)
+```
+
+We can plot and colour these structure categories.
+
+```{r}
+plot_cell_categories(formatted_structure, feature_colname = "Structure")
+```
+
+Then calculate the proportions of immune cells in each of the locations.
+
+```{r}
+immune_proportions <- calculate_proportions_of_cells_in_structure(
+  spe_object = formatted_structure, 
+  cell_types_of_interest = names_of_immune_cells, feature_colname ="Cell.Type")
+
+immune_proportions
+```
+
+Finally calculate summaries of the distances for immune cells in the
+tumour structure.
+
+```{r}
+immune_distances <- calculate_summary_distances_of_cells_to_borders(
+  spe_object = formatted_structure, 
+  cell_types_of_interest = names_of_immune_cells, feature_colname = "Cell.Type")
+
+immune_distances
+```
+
+# Cellular neighbourhood
+
+The aggregation of cells can result in cellular neighbourhoods. A
+neighbourhood is defined as a group of cells that cluster together.
+These can be homotypic, containing cells of a single class (e.g.immune
+cells), or heterotypic (e.g.a mixture of tumour and immune cells).
+
+Function `identify_neighborhoods()` identifies cellular neighbourhoods.
+Users can select a subset of cell types of interest if desired. The
+algorithm is *Hierarchical Clustering algorithm* - Euclidean distances
+between cells are calculated, and pairs of cells with a distance less
+than a specified radius are considered to be interacting, with the rest
+being non-interacting. Hierarchical clustering is then used to separate
+the clusters. Larger radii will result in the merging of individual
+clusters.
+
+You need to specify a radius that defines the distance for an
+interaction. We suggest testing different radii and select the one that
+generates intuitive clusters upon visualisation. Cells not assigned to
+clusters are assigned as `Cluster_NA` in the output table. The argument
+`min_neighborhood_size` specifies the threshold of a neighborhood size
+to be considered as a neighborhood. Smaller neighbourhoods will be
+outputted, but will not be assigned a number.
+
+Please test out different radii and then visualise the clustering
+results. To aid in this process, users can use the
+`average_minimum_distance()` function, which calculates the average
+minimum distance between all cells in an image, and can be used as a
+starting point.
+
+```{r}
+average_minimum_distance(defined_mibi_4)
+```
+
+We then identify the cellular neighbourhoods using our hierarchical
+algorithm with a radius of 50, and with a minimum neighbourhood size of
+100. Cells assigned to neighbourhoods smaller than 100 will be assigned
+to the Cluster_NA neighbourhood.
+
+```{r}
+clusters <- identify_neighborhoods(
+  defined_mibi_4, method = "hierarchical", min_neighborhood_size = 100,
+  cell_types_of_interest = c("B_cells",  "Helper_T_cell", "T_cell",
+                "Cyto_T_cell",  "Helper_T_cell", "Neutrophil", "Cyto_T_cell"), radius = 50, 
+  feature_colname = "Cell.Type")
+```
+
+Black cells correspond to 'free', un-clustered cells.
+
+We can visualise the cell composition of neighborhoods. To do this, we
+can use `composition_of_neighborhoods()` to obtain the percentages of
+cells with a specific marker within each neighborhood and the number of
+cells in the neighborhood.
+
+In this example we select cellular neighbourhoods with at least 5 cells.
+
+```{r}
+neighorhoods_vis <- 
+  composition_of_neighborhoods(clusters, feature_colname = "Cell.Type")
+neighorhoods_vis <- 
+  neighorhoods_vis[neighorhoods_vis$Total_number_of_cells >=5,]
+```
+
+Finally, we can use `plot_composition_heatmap()` to produce a heatmap
+showing the marker percentages within each cluster, which can be used to
+classify the derived neighbourhoods.
+
+```{r}
+plot_composition_heatmap(neighorhoods_vis, feature_colname="Cell.Type")
+```
+
+# Challenge
+
+So far we have walked through the analysis workflow. Now it's your turn
+to do some analyses!
+
+The TNBC MIBI data set provides the clinical information of 39 patients.
+Try applying some spatial metrics to these images and associate them
+with the clinical data!
+
+The SPE objects have been pre-formatted for you. Please load the objects:
+
+```{r}
+load("MIBI_spe.Rda") # load the MIBI_spe objects
+# The code of formatting the images is in SPIAT_worksheet_solutions.Rmd file
+```
+
+Here is only an example of what you can do with the SPIAT functions. Please
+follow me to complete the code.
+
+```{r, message = FALSE}
+# calculate the mixing score of each patient
+mixing_score <- list()
+normalised_mixing_score <- list()
+for(patient in names(MIBI_spe)){
+   ms <- mixing_score_summary(
+    spe_object = MIBI_spe[[patient]], reference_celltype = "Tumor",
+    target_celltype = "Macrophage", radius = 20, feature_colname = "Cell.Type2")
+  mixing_score[[patient]] <- ms$Mixing_score
+  normalised_mixing_score[[patient]] <- ms$Normalised_mixing_score
+  print(patient)
+}
+# group the patients based on their normalised mixing score
+nms <- na.omit(unlist(normalised_mixing_score))
+
+low_nms <- normalised_mixing_score < 0.25 # this is an arbitrary threshold, adopted from the spaSim benchmarking
+group_repulsion <- names(which(low_nms == TRUE))
+group_attraction <- names(which(low_nms == FALSE))
+
+# read in metadata
+metadata <- read.delim("Formatted_clinical_data.csv", sep = ",")
+metadata$Patient <- paste("Patient", metadata$InternalId, sep="_")
+rownames(metadata) <- metadata$Patient
+
+# join the data
+metadata$Mixing_group <- NA
+metadata$Mixing_group[rownames(metadata) %in% group_repulsion] <- "Group_Repulsion"
+metadata$Mixing_group[rownames(metadata) %in% group_attraction] <- "Group_Attraction"
+
+# survival
+library(survminer)
+library(survival)
+survival <- survfit(Surv(Survival_days_capped., Censored) ~ Mixing_group, data=metadata)
+  
+g <- ggsurvplot(survival, 
+             xlab = "Days", 
+             ylab = "Overall survival probability", pval=TRUE)
+print(g)
+```
+
+# Introduction to spaSim
+
+`spaSim` (**spa**tial **Sim**ulator) is a simulator of tumour immune
+microenvironment spatial data. It includes a family of functions to
+simulate a diverse set of cell localisation patterns in tissues.
+Patterns include background cells (one cell type or multiple cell types
+of different proportions), tumour/immune clusters, immune rings and
+double immune rings and stripes (blood/lymphatic vessels).
+
+Simulations from spaSim can be applied to test and benchmark spatial
+tools and metrics (like the ones in `SPIAT`). The output of spaSim are
+images in `SpatialExperiment` object format.
+
+In this workshop, we will only cover how to simulate individual images.
+For more information about how to simulate a set of images, please refer to the 
+[spaSim tutorial](https://trigosteam.github.io/spaSim/articles/vignette.html).
+
+```{r}
+# simulate background cells
+set.seed(610)
+bg <- simulate_background_cells(n_cells = 5000,
+                                width = 2000,
+                                height = 2000,
+                                method = "Hardcore",
+                                min_d = 10,
+                                oversampling_rate = 1.6,
+                                Cell.Type = "Others")
+```
+
+```{r}
+# simulate mixed background
+mix_bg <- simulate_mixing(bg_sample = bg,
+                          idents = c("Tumour", "Immune", "Others"),
+                          props = c(0.2, 0.3, 0.5), 
+                          plot_image = TRUE,
+                          plot_colours = c("red","darkgreen","lightgray"))
+```
+
+```{r}
+# simulate clusters
+cluster_properties <- list(
+  C1 =list(name_of_cluster_cell = "Tumour", size = 500, shape = "Oval", 
+           centre_loc = data.frame(x = 600, y = 600),infiltration_types = c("Immune1", "Others"), 
+           infiltration_proportions = c(0.1, 0.05)), 
+  C2 = list(name_of_cluster_cell = "Immune1", size = 600,  shape = "Irregular", 
+            centre_loc = data.frame(x = 1500, y = 500), infiltration_types = c("Immune", "Others"),
+            infiltration_proportions = c(0.1, 0.05)))
+# can use any defined image as background image, here we use mix_bg defined in the previous section
+clusters <- simulate_clusters(bg_sample = mix_bg,
+                              n_clusters = 2,
+                              bg_type = "Others",
+                              cluster_properties = cluster_properties,
+                              plot_image = TRUE,
+                              plot_categories = c("Tumour" , "Immune", "Immune1", "Others"),
+                              plot_colours = c("red", "darkgreen", "darkblue", "lightgray"))
+```
+
+```{r}
+# simulate immune rings
+immune_ring_properties <- list(
+  I1 = list(name_of_cluster_cell = "Tumour", size = 500, 
+            shape = "Circle", centre_loc = data.frame(x = 930, y = 1000), 
+            infiltration_types = c("Immune1", "Immune2", "Others"), 
+            infiltration_proportions = c(0.15, 0.05, 0.05),
+            name_of_ring_cell = "Immune1", immune_ring_width = 150,
+            immune_ring_infiltration_types = c("Immune2", "Others"), 
+            immune_ring_infiltration_proportions = c(0.1, 0.15)))
+rings <- simulate_immune_rings(
+  bg_sample = bg,
+  bg_type = "Others",
+  n_ir = 1,
+  ir_properties = immune_ring_properties,
+  plot_image = TRUE,
+  plot_categories = c("Tumour", "Immune1", "Immune2", "Others"),
+  plot_colours = c("red", "darkgreen", "darkblue", "lightgray"))
+```
+
